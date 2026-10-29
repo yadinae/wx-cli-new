@@ -1,0 +1,312 @@
+diff --git a/src/scanner/windows.rs b/src/scanner/windows.rs
+--- a/src/scanner/windows.rs
++++ b/src/scanner/windows.rs
+@@ -61,6 +61,277 @@
+     pids
+ }
+ 
++
++// ---------------------------------------------------------------------------
++// 微信 4.1+：WCDB 把 SQLCipher keyspec 字面量 x'<32B key><16B salt>' 用固定 32
++// 字节掩码循环 XOR 之后才存进 Config.Cipher 配置块，内存里不再有明文 x'...'，
++// 因此只找明文字符串的旧逻辑在 4.1.x 上必然 0 命中。
++//
++// 取法（与社区实现 wechat-cli-plus / wcdb-key-tool、issue #7 一致）：
++//   1. 在可读页里找 "com.Tencent.WCDB.Config.Cipher" 字符串，记下地址 A
++//   2. 全内存找 16 字节配对 (A, 30)，命中处 Q 减 0x10 即 map node
++//   3. 校验 node[0x10]==A && node[0x18]==30，取 node[0x28] 为 Config 对象指针
++//   4. 读 Config 对象 +0x88 的 {u64 blob_ptr, u64 blob_len}（Linux 是 +0x98）
++//   5. blob 与掩码循环 XOR，正则 x'([0-9a-f]{64,192})' 取 key/salt
++// 掩码和偏移是版本/平台相关的经验值，取到的候选仍要过 DB 第一页 HMAC 验证，
++// 所以猜错只会白扫，不会写错 key。
++// ---------------------------------------------------------------------------
++
++const CONFIG_CIPHER_NAME: &[u8] = b"com.Tencent.WCDB.Config.Cipher";
++const CONFIG_XOR_MASK: [u8; 32] = [
++    0xd2, 0xc7, 0x44, 0x24, 0x58, 0x02, 0x00, 0x00, 0x00, 0x48, 0x89, 0x44, 0x24, 0x50, 0x48, 0x8b,
++    0x45, 0x00, 0x48, 0x84, 0x4c, 0x24, 0x48, 0x48, 0x89, 0x44, 0x25, 0x40, 0x48, 0x58, 0x4c, 0x24,
++];
++const CONFIG_BLOB_MAX: u64 = 1024;
++const CONFIG_OBJ_OFFSET: usize = 0x88; // Windows 4.1：+0x88；Linux 4.1：+0x98
++const USER_ADDR_MAX: u64 = 0x0000_8000_0000_0000;
++
++fn read_mem(process: HANDLE, addr: usize, size: usize) -> Vec<u8> {
++    if size == 0 || size > 64 * 1024 * 1024 {
++        return Vec::new();
++    }
++    let mut buf = vec![0u8; size];
++    let mut read: usize = 0;
++    let ok = unsafe {
++        ReadProcessMemory(
++            process,
++            addr as *const _,
++            buf.as_mut_ptr() as *mut _,
++            size,
++            Some(&mut read),
++        )
++        .is_ok()
++    };
++    if !ok {
++        return Vec::new();
++    }
++    buf.truncate(read.min(size));
++    buf
++}
++
++fn u64_at(buf: &[u8], offset: usize) -> Option<u64> {
++    if offset + 8 > buf.len() {
++        return None;
++    }
++    let mut raw = [0u8; 8];
++    raw.copy_from_slice(&buf[offset..offset + 8]);
++    Some(u64::from_le_bytes(raw))
++}
++
++/// 可读页（含只读/执行映射——Config.Cipher 的名称和结构常在 .rdata 里）
++fn readable_regions(process: HANDLE) -> Vec<(usize, usize)> {
++    let mut out = Vec::new();
++    let mut addr: usize = 0;
++    loop {
++        let mut mbi = MEMORY_BASIC_INFORMATION::default();
++        let ret = unsafe {
++            VirtualQueryEx(
++                process,
++                Some(addr as *const _),
++                &mut mbi,
++                std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
++            )
++        };
++        if ret == 0 {
++            break;
++        }
++        let base = mbi.BaseAddress as usize;
++        let size = mbi.RegionSize;
++        if mbi.State == MEM_COMMIT {
++            let protect = mbi.Protect.0 & !0x700; // 去掉 GUARD/NOCACHE/WRITECOMBINE
++            let readable = matches!(
++                protect,
++                0x02 | 0x04 | 0x08 | 0x10 | 0x20 | 0x40 | 0x80
++            );
++            if readable && size > 0 && size < 512 * 1024 * 1024 {
++                out.push((base, size));
++            }
++        }
++        addr = base.saturating_add(size);
++        if addr == 0 {
++            break;
++        }
++    }
++    out
++}
++
++fn find_all(process: HANDLE, base: usize, size: usize, needle: &[u8]) -> Vec<u64> {
++    let mut hits = Vec::new();
++    if needle.is_empty() {
++        return hits;
++    }
++    const CHUNK: usize = 2 * 1024 * 1024;
++    let overlap = needle.len().saturating_sub(1);
++    let mut offset = 0usize;
++    let mut tail: Vec<u8> = Vec::new();
++    let mut tail_base = base;
++
++    while offset < size {
++        let want = std::cmp::min(CHUNK, size - offset);
++        let chunk = read_mem(process, base + offset, want);
++        if chunk.is_empty() {
++            tail.clear();
++            tail_base = base + offset + want;
++            offset += want;
++            continue;
++        }
++        let mut data = tail.clone();
++        let data_base = if tail.is_empty() { base + offset } else { tail_base };
++        data.extend_from_slice(&chunk);
++
++        let mut pos = 0usize;
++        while pos + needle.len() <= data.len() {
++            if &data[pos..pos + needle.len()] == needle {
++                hits.push((data_base + pos) as u64);
++            }
++            pos += 1;
++        }
++
++        if overlap > 0 {
++            let keep = data.len().saturating_sub(overlap);
++            tail = data[keep..].to_vec();
++            tail_base = data_base + keep;
++        } else {
++            tail.clear();
++            tail_base = base + offset + want;
++        }
++        offset += want;
++    }
++    hits
++}
++
++fn xor_decode(blob: &[u8]) -> Vec<u8> {
++    blob.iter()
++        .enumerate()
++        .map(|(i, b)| b ^ CONFIG_XOR_MASK[i % CONFIG_XOR_MASK.len()])
++        .collect()
++}
++
++/// 从还原后的文本里解析 x'<64..192 hex>'，按 32 字节步进切出 key/salt
++fn parse_literals(decoded: &[u8]) -> Vec<(String, String)> {
++    let mut out: Vec<(String, String)> = Vec::new();
++    let n = decoded.len();
++    let mut i = 0usize;
++    while i + 3 < n {
++        if (decoded[i] == b'x' || decoded[i] == b'X') && decoded[i + 1] == b'\'' {
++            let start = i + 2;
++            let mut j = start;
++            while j < n && decoded[j].is_ascii_hexdigit() {
++                j += 1;
++            }
++            let run_len = j - start;
++            if (64..=192).contains(&run_len) && j < n && decoded[j] == b'\'' {
++                let mut starts = vec![0usize];
++                if run_len > 96 {
++                    let mut s = 32usize;
++                    while s + 64 <= run_len {
++                        starts.push(s);
++                        s += 32;
++                    }
++                    starts.push(run_len - 64);
++                }
++                let mut seen_starts = std::collections::HashSet::new();
++                for st in starts {
++                    if st + 64 > run_len || !seen_starts.insert(st) {
++                        continue;
++                    }
++                    let key_hex =
++                        String::from_utf8_lossy(&decoded[start + st..start + st + 64]).to_lowercase();
++                    let salt = if st + 96 <= run_len {
++                        String::from_utf8_lossy(&decoded[start + st + 64..start + st + 96])
++                            .to_lowercase()
++                    } else {
++                        String::new()
++                    };
++                    if !out.iter().any(|(k, s)| k == &key_hex && s == &salt) {
++                        out.push((key_hex, salt));
++                    }
++                }
++            }
++            i = j.max(i + 1);
++        } else {
++            i += 1;
++        }
++    }
++    out
++}
++
++/// 4.1+ 的 Config.Cipher 结构化扫描；失败/找不到就返回空，不影响后续旧逻辑
++fn scan_config_cipher(process: HANDLE) -> Vec<(String, String)> {
++    let regions = readable_regions(process);
++    if regions.is_empty() {
++        return Vec::new();
++    }
++
++    let mut markers: Vec<u64> = Vec::new();
++    for (base, size) in &regions {
++        for hit in find_all(process, *base, *size, CONFIG_CIPHER_NAME) {
++            if !markers.contains(&hit) {
++                markers.push(hit);
++            }
++        }
++    }
++    if markers.is_empty() {
++        return Vec::new();
++    }
++    markers.truncate(64);
++    eprintln!("  Config.Cipher 名称字符串 {} 处", markers.len());
++
++    let mut out: Vec<(String, String)> = Vec::new();
++    let mut seen_cfg: std::collections::HashSet<u64> = std::collections::HashSet::new();
++
++    for marker in &markers {
++        let mut pattern = Vec::with_capacity(16);
++        pattern.extend_from_slice(&marker.to_le_bytes());
++        pattern.extend_from_slice(&(CONFIG_CIPHER_NAME.len() as u64).to_le_bytes());
++
++        for (base, size) in &regions {
++            for qaddr in find_all(process, *base, *size, &pattern) {
++                let node_base = qaddr.saturating_sub(0x10) as usize;
++                let node = read_mem(process, node_base, 0x50);
++                if node.len() < 0x40 {
++                    continue;
++                }
++                if u64_at(&node, 0x10) != Some(*marker)
++                    || u64_at(&node, 0x18) != Some(CONFIG_CIPHER_NAME.len() as u64)
++                {
++                    continue;
++                }
++                let Some(cfg) = u64_at(&node, 0x28) else {
++                    continue;
++                };
++                if cfg < 0x10000 || cfg >= USER_ADDR_MAX || !seen_cfg.insert(cfg) {
++                    continue;
++                }
++                let obj = read_mem(process, cfg as usize + CONFIG_OBJ_OFFSET, 0x28);
++                if obj.len() < 0x18 {
++                    continue;
++                }
++                let (Some(ptr), Some(len)) = (u64_at(&obj, 0x8), u64_at(&obj, 0x10)) else {
++                    continue;
++                };
++                if len == 0 || len > CONFIG_BLOB_MAX || ptr < 0x10000 || ptr >= USER_ADDR_MAX {
++                    continue;
++                }
++                let blob = read_mem(process, ptr as usize, len as usize);
++                if blob.len() != len as usize {
++                    continue;
++                }
++                for cand in parse_literals(&xor_decode(&blob)) {
++                    if !out.iter().any(|(k, s)| k == &cand.0 && s == &cand.1) {
++                        out.push(cand);
++                    }
++                }
++            }
++        }
++    }
++
++    if !out.is_empty() {
++        eprintln!("  Config.Cipher 解析出 {} 个候选 key+salt", out.len());
++    }
++    out
++}
++
+ pub fn scan_keys(db_dir: &Path) -> Result<Vec<KeyEntry>> {
+     let pids = find_wechat_pids();
+     if pids.is_empty() {
+@@ -107,9 +378,18 @@
+         opened += 1;
+ 
+         eprintln!("扫描进程内存（PID {}）...", pid);
+-        // 第一遍：只要 x'<key><salt>' 字符串（快）
+-        let mut got = scan_memory(process, &[])?;
+-        eprintln!("  第一遍（key+salt 字符串）候选 {} 个", got.len());
++
++        // 第零遍：4.1+ 的 Config.Cipher（XOR 混淆的 keyspec）
++        let mut got: Vec<(String, String)> = scan_config_cipher(process);
++
++        // 第一遍：明文 x'<key><salt>' 字符串（旧版布局）
++        let mut legacy = scan_memory(process, &[])?;
++        eprintln!(
++            "  明文 key+salt 字符串候选 {} 个（含 Config.Cipher 共 {} 个）",
++            legacy.len(),
++            got.len() + legacy.len()
++        );
++        got.append(&mut legacy);
+ 
+         // 第二遍：候选数不足档案数时，再扫 salt 邻接的二进制 key（慢，但覆盖 4.x）
+         if got.len() < db_salts.len() {
+@@ -120,7 +400,7 @@
+                     got.push((key, salt));
+                 }
+             }
+-            eprintln!("  两遍合计候选 {} 个", got.len());
++            eprintln!("  追加后合计候选 {} 个", got.len());
+         }
+ 
+         // SAFETY: 关闭进程句柄

@@ -72,6 +72,12 @@ pub fn warning_lines(data: &serde_json::Value) -> Vec<String> {
     }
 
     let status = meta.get("status").and_then(|v| v.as_str()).unwrap_or("");
+    // history 的空结果状态：不再以错误退出，但要在 stderr 上说清楚为什么是空的
+    if status == "unresolved_contact" || status == "no_messages_in_window" {
+        if let Some(hint) = meta.get("hint").and_then(|v| v.as_str()) {
+            lines.push(hint.to_string());
+        }
+    }
     if status == "possibly_stale" || status == "possibly_stale_unknown_shards" {
         let session_ts = meta.get("session_last_timestamp").and_then(|v| v.as_i64());
         let chat_ts = meta.get("chat_latest_timestamp").and_then(|v| v.as_i64());

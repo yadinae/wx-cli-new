@@ -4,13 +4,20 @@ use std::path::{Path, PathBuf};
 
 /// 产品统一推荐：补齐/重提数据库密钥（含冷分片 hook）。
 /// 所有用户可见错误/警告应指向此命令，避免 `init --force` 与 `key extract` 分叉。
+#[cfg(not(target_os = "windows"))]
 pub const RECOMMENDED_KEY_EXTRACT: &str = "sudo wx key extract --hook-seconds 90";
+#[cfg(target_os = "windows")]
+pub const RECOMMENDED_KEY_EXTRACT: &str = "wx key extract";
 
 /// 带冷分片操作说明的完整提示（一行或多行均可嵌入）。
+#[cfg(not(target_os = "windows"))]
 pub const RECOMMENDED_KEY_EXTRACT_HINT: &str =
     "sudo wx key extract --hook-seconds 90（等待期间在微信中打开相关聊天以捕获冷分片密钥）";
+#[cfg(target_os = "windows")]
+pub const RECOMMENDED_KEY_EXTRACT_HINT: &str =
+    "wx key extract（以管理员身份运行；确保微信已登录并保持运行）";
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "windows")))]
 mod recommended_cmd_tests {
     use super::*;
 

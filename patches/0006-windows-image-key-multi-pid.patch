@@ -1,0 +1,126 @@
+diff --git a/src/attachment/image_key/windows.rs b/src/attachment/image_key/windows.rs
+--- a/src/attachment/image_key/windows.rs
++++ b/src/attachment/image_key/windows.rs
+@@ -3,7 +3,7 @@
+ //! 扫 `Weixin.exe` 进程内存，匹配模式 `[A-Za-z0-9]{32}` / `[A-Za-z0-9]{16}`，
+ //! 然后用 V2 模板 AES block 反验，控制 false positive。
+ 
+-use anyhow::{bail, Context, Result};
++use anyhow::{anyhow, bail, Result};
+ use std::collections::{HashMap, HashSet};
+ use std::path::PathBuf;
+ use std::sync::Mutex;
+@@ -76,42 +76,73 @@
+         .map(|(key, _, _)| key)
+         .unwrap_or(0x88);
+ 
+-    let pid = find_wechat_pid().context("找不到 Weixin.exe 进程，请确认微信正在运行")?;
+-    let process = unsafe {
+-        OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, false, pid)
+-            .context("OpenProcess 失败，请以管理员权限运行")?
+-    };
+-
+-    let aes_key = scan_memory_for_key(process, &templates);
+-    unsafe {
+-        let _ = CloseHandle(process);
++    // 微信 4.x 会同时存在多个 Weixin.exe（主进程 + 渲染/工具进程）。
++    // 只扫「枚举到的第一个」有可能扫到不持有 image key 的进程，这里逐个尝试，
++    // 谁能扫出通过模板验证的 key 就用谁。
++    let pids = find_wechat_pids();
++    if pids.is_empty() {
++        bail!("找不到 Weixin.exe 进程，请确认微信正在运行");
++    }
++    let total = pids.len();
++    let mut open_failures = 0usize;
++    let mut last_err: Option<anyhow::Error> = None;
++
++    for pid in pids {
++        let process = match unsafe { OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, false, pid) } {
++            Ok(handle) => handle,
++            Err(err) => {
++                open_failures += 1;
++                last_err = Some(anyhow!("OpenProcess(PID {}) 失败: {}", pid, err));
++                continue;
++            }
++        };
++        let scanned = scan_memory_for_key(process, &templates);
++        unsafe {
++            let _ = CloseHandle(process);
++        }
++        match scanned {
++            Ok(aes_key) => {
++                return Ok(ImageKeyMaterial {
++                    aes_key,
++                    xor_key,
++                })
++            }
++            Err(err) => last_err = Some(err),
++        }
+     }
+ 
+-    Ok(ImageKeyMaterial {
+-        aes_key: aes_key?,
+-        xor_key,
+-    })
++    if open_failures == total {
++        bail!(
++            "无法读取任何 Weixin.exe 进程内存（{} 个进程全部 OpenProcess 失败），请以管理员权限运行",
++            total
++        );
++    }
++    Err(last_err.unwrap_or_else(|| anyhow!("没有可扫描的 Weixin.exe 进程")))
+ }
+ 
+-fn find_wechat_pid() -> Option<u32> {
+-    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0).ok()? };
++fn find_wechat_pids() -> Vec<u32> {
++    let Ok(snapshot) = (unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }) else {
++        return Vec::new();
++    };
+     let mut entry = PROCESSENTRY32 {
+         dwSize: std::mem::size_of::<PROCESSENTRY32>() as u32,
+         ..Default::default()
+     };
+ 
++    let mut pids: Vec<u32> = Vec::new();
+     unsafe {
+         if Process32First(snapshot, &mut entry).is_err() {
+             let _ = CloseHandle(snapshot);
+-            return None;
++            return pids;
+         }
+         loop {
+             let name =
+                 std::ffi::CStr::from_ptr(entry.szExeFile.as_ptr() as *const i8).to_string_lossy();
+-            if name.eq_ignore_ascii_case("Weixin.exe") {
+-                let pid = entry.th32ProcessID;
+-                let _ = CloseHandle(snapshot);
+-                return Some(pid);
++            // 4.x 客户端是 Weixin.exe；老一点的 4.0.x/3.x 布局里仍是 WeChat.exe
++            if name.eq_ignore_ascii_case("Weixin.exe") || name.eq_ignore_ascii_case("WeChat.exe") {
++                if entry.th32ProcessID != 0 {
++                    pids.push(entry.th32ProcessID);
++                }
+             }
+             if Process32Next(snapshot, &mut entry).is_err() {
+                 break;
+@@ -119,7 +150,7 @@
+         }
+         let _ = CloseHandle(snapshot);
+     }
+-    None
++    pids
+ }
+ 
+ fn scan_memory_for_key(process: HANDLE, templates: &[[u8; 16]]) -> Result<[u8; 16]> {
+@@ -142,6 +173,10 @@
+ 
+         let base = mbi.BaseAddress as usize;
+         let size = mbi.RegionSize;
++        if size == 0 {
++            // 防御：RegionSize 为 0 时 base+size 不前进，会无限循环
++            break;
++        }
+         if mbi.State == MEM_COMMIT && is_candidate_page(mbi.Protect.0) && size <= MAX_REGION_SIZE {
+             if let Some(aes_key) = scan_region(process, base, size, templates, &mut seen)? {
+                 return Ok(aes_key);

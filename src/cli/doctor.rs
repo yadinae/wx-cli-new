@@ -3,6 +3,7 @@
 use anyhow::Result;
 use serde_json::json;
 use std::path::Path;
+#[cfg(not(target_os = "windows"))]
 use std::process::Command;
 
 use crate::config;
@@ -53,6 +54,13 @@ pub fn cmd_doctor(json: bool, fix: bool) -> Result<()> {
         if all_ok {
             println!("\n全部检查通过。");
         } else {
+            #[cfg(target_os = "windows")]
+            println!(
+                "\n存在未通过项。补密钥：{}\n\
+                 （以管理员身份打开 PowerShell 执行；确保微信已登录并保持运行）",
+                config::RECOMMENDED_KEY_EXTRACT
+            );
+            #[cfg(not(target_os = "windows"))]
             println!(
                 "\n存在未通过项。补密钥：{}\n\
                  （本机 GUI Terminal + 等待时打开相关聊天；SIP 无需关闭）",
@@ -279,18 +287,35 @@ fn run_checks() -> Vec<Check> {
         });
     }
 
-    // daemon sock
-    let sock = config::sock_path();
-    out.push(Check {
-        name: "daemon socket".into(),
-        ok: sock.exists(),
-        detail: if sock.exists() {
-            sock.display().to_string()
-        } else {
-            "未运行（首次查询会自动启动）".into()
-        },
-        fix: Some("wx sessions 或 wx daemon start".into()),
-    });
+    // daemon 在线状态：Unix 看 socket 文件，Windows 走命名管道 ping
+    #[cfg(unix)]
+    {
+        let sock = config::sock_path();
+        out.push(Check {
+            name: "daemon socket".into(),
+            ok: sock.exists(),
+            detail: if sock.exists() {
+                sock.display().to_string()
+            } else {
+                "未运行（首次查询会自动启动）".into()
+            },
+            fix: Some("wx sessions（会自动启动）或 wx daemon status".into()),
+        });
+    }
+    #[cfg(windows)]
+    {
+        let alive = crate::cli::transport::is_alive();
+        out.push(Check {
+            name: "daemon 管道".into(),
+            ok: alive,
+            detail: if alive {
+                r"\\.\pipe\wx-cli-daemon 已连通".into()
+            } else {
+                "未运行（首次查询会自动启动）".into()
+            },
+            fix: Some("wx sessions（会自动启动）或 wx daemon status".into()),
+        });
+    }
 
     out
 }
@@ -338,8 +363,15 @@ fn format_missing_preview(items: &[scanner::MissingDb], max: usize) -> String {
     }
 }
 
+/// macOS / Linux：用 pgrep 匹配客户端主进程名（Windows 上没有 pgrep）
+#[cfg(not(target_os = "windows"))]
 fn find_wechat_pid() -> Option<u32> {
-    let out = Command::new("pgrep").args(["-x", "WeChat"]).output().ok()?;
+    #[cfg(target_os = "macos")]
+    const EXE: &str = "WeChat";
+    #[cfg(target_os = "linux")]
+    const EXE: &str = "wechat";
+
+    let out = Command::new("pgrep").args(["-x", EXE]).output().ok()?;
     if !out.status.success() {
         return None;
     }
@@ -349,6 +381,43 @@ fn find_wechat_pid() -> Option<u32> {
         .trim()
         .parse()
         .ok()
+}
+
+/// Windows：没有 pgrep，用 Toolhelp 进程快照匹配 Weixin.exe（4.x）/ WeChat.exe（3.x）
+#[cfg(target_os = "windows")]
+fn find_wechat_pid() -> Option<u32> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32First, Process32Next, PROCESSENTRY32, TH32CS_SNAPPROCESS,
+    };
+
+    // SAFETY: 标准 Toolhelp 快照遍历，句柄用完即关
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0).ok()?;
+        let mut entry = PROCESSENTRY32 {
+            dwSize: std::mem::size_of::<PROCESSENTRY32>() as u32,
+            ..Default::default()
+        };
+
+        let mut found = None;
+        if Process32First(snap, &mut entry).is_ok() {
+            loop {
+                let name = std::ffi::CStr::from_ptr(entry.szExeFile.as_ptr() as *const i8)
+                    .to_string_lossy();
+                if name.eq_ignore_ascii_case("Weixin.exe") || name.eq_ignore_ascii_case("WeChat.exe")
+                {
+                    found = Some(entry.th32ProcessID);
+                    break;
+                }
+                if Process32Next(snap, &mut entry).is_err() {
+                    break;
+                }
+            }
+        }
+
+        let _ = CloseHandle(snap);
+        found
+    }
 }
 
 fn read_key_for(keys_path: &Path, rel: &str) -> Option<String> {

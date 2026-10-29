@@ -1,0 +1,318 @@
+diff --git a/Cargo.toml b/Cargo.toml
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -73,6 +73,8 @@
+     "Win32_System_Memory",
+     "Win32_System_Com",
+     "Win32_UI_Shell",
++    "Win32_Security",
++    "Win32_Security_Authorization",
+ ] }
+ 
+ [profile.release]
+diff --git a/src/daemon/mod.rs b/src/daemon/mod.rs
+--- a/src/daemon/mod.rs
++++ b/src/daemon/mod.rs
+@@ -3,6 +3,8 @@
+ pub mod query;
+ pub mod server;
+ pub mod shard_meta;
++#[cfg(windows)]
++pub mod win_dacl;
+ 
+ use anyhow::Result;
+ use std::collections::HashMap;
+@@ -112,6 +114,9 @@
+     // 用 tokio::sync::RwLock 允许 guard 跨 await（当前不跨，为未来 reload 留余地）。
+     let names_arc = Arc::new(tokio::sync::RwLock::new(Arc::new(names)));
+ 
++    // 跟随微信客户端退出：客户端进程消失后 daemon 自动退出并清理 pid/sock
++    spawn_client_watch();
++
+     // 启动 IPC server（阻塞）
+     let serve_result = server::serve(Arc::clone(&db), Arc::clone(&names_arc)).await;
+     cleanup_ipc_files();
+@@ -204,6 +209,101 @@
+     let _ = std::fs::remove_file(config::pid_path());
+ }
+ 
++/// daemon 跟随微信客户端退出
++///
++/// 每 10 秒探测一次客户端进程，连续两次未命中即清理 pid/sock 后退出，
++/// 避免微信已经关掉、daemon 还挂在后台占用数据库句柄。
++/// 设置 `WX_DAEMON_FOLLOW_CLIENT=0` 可关闭该行为。
++fn spawn_client_watch() {
++    if std::env::var("WX_DAEMON_FOLLOW_CLIENT").as_deref() == Ok("0") {
++        eprintln!("[daemon] 已关闭「跟随微信退出」(WX_DAEMON_FOLLOW_CLIENT=0)");
++        return;
++    }
++
++    tokio::spawn(async move {
++        // 启动宽限期：微信可能还没起来或用户正在登录，先给 30 秒
++        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
++
++        let mut misses = 0u32;
++        loop {
++            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
++            if client_process_running() {
++                misses = 0;
++                continue;
++            }
++            misses += 1;
++            if misses >= 2 {
++                eprintln!("[daemon] 微信客户端已退出，daemon 跟随退出");
++                cleanup_ipc_files();
++                std::process::exit(0);
++            }
++        }
++    });
++}
++
++#[cfg(target_os = "windows")]
++fn client_process_running() -> bool {
++    use windows::Win32::Foundation::CloseHandle;
++    use windows::Win32::System::Diagnostics::ToolHelp::{
++        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
++        TH32CS_SNAPPROCESS,
++    };
++
++    // 微信 4.x 是 Weixin.exe，3.x 时代是 WeChat.exe，两个都认
++    const CLIENT_EXES: [&str; 2] = ["Weixin.exe", "WeChat.exe"];
++
++    unsafe {
++        let snap = match CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) {
++            Ok(h) => h,
++            // 探测失败按「仍在运行」处理，宁可 daemon 多留一会，也不要误杀
++            Err(_) => return true,
++        };
++
++        let mut entry = PROCESSENTRY32W {
++            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
++            ..Default::default()
++        };
++
++        let mut found = false;
++        if Process32FirstW(snap, &mut entry).is_ok() {
++            loop {
++                let end = entry
++                    .szExeFile
++                    .iter()
++                    .position(|&c| c == 0)
++                    .unwrap_or(entry.szExeFile.len());
++                let name = String::from_utf16_lossy(&entry.szExeFile[..end]);
++                if CLIENT_EXES.iter().any(|exe| exe.eq_ignore_ascii_case(&name)) {
++                    found = true;
++                    break;
++                }
++                if Process32NextW(snap, &mut entry).is_err() {
++                    break;
++                }
++            }
++        }
++
++        let _ = CloseHandle(snap);
++        found
++    }
++}
++
++#[cfg(target_os = "macos")]
++fn client_process_running() -> bool {
++    // 用 pgrep 判断微信主进程是否还在，不额外引入依赖
++    match std::process::Command::new("pgrep").args(["-x", "WeChat"]).output() {
++        Ok(out) => out.status.success(),
++        // 探测失败按「仍在运行」处理
++        Err(_) => true,
++    }
++}
++
++#[cfg(all(unix, not(target_os = "macos")))]
++fn client_process_running() -> bool {
++    // Linux 侧走文件解密，没有必须跟随的客户端进程
++    true
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::{is_biz_msg_db_key, is_msg_db_key};
+diff --git a/src/daemon/server.rs b/src/daemon/server.rs
+--- a/src/daemon/server.rs
++++ b/src/daemon/server.rs
+@@ -82,23 +82,41 @@
+     db: Arc<DbCache>,
+     names: Arc<tokio::sync::RwLock<Arc<Names>>>,
+ ) -> Result<()> {
+-    use interprocess::local_socket::{tokio::prelude::*, GenericNamespaced, ListenerOptions};
++    use tokio::net::windows::named_pipe::ServerOptions;
+ 
+-    // interprocess 的 GenericNamespaced 在 Windows 上会自动拼接 `\\.\pipe\` 前缀，
+-    // 这里必须传相对名；client 端用 `\\.\pipe\wx-cli-daemon` 直接打开可以对上
+-    let name = "wx-cli-daemon".to_ns_name::<GenericNamespaced>()?;
+-    let opts = ListenerOptions::new().name(name);
+-    let listener = opts.create_tokio()?;
++    // 与 client 端（interprocess GenericNamespaced）保持同一个管道路径
++    const PIPE_NAME: &str = r"\\.\pipe\wx-cli-daemon";
+ 
+-    eprintln!("[server] 监听 \\\\.\\pipe\\wx-cli-daemon");
++    // 显式 DACL：只允许当前用户与 SYSTEM 连接，不再依赖进程 token 的默认 DACL
++    let security = super::win_dacl::current_user_only()
++        .map_err(|e| anyhow::anyhow!("构造具名管道 DACL 失败: {}", e))?;
++
++    let mut opts = ServerOptions::new();
++    opts.first_pipe_instance(true);
++    // tokio 1.5x 起只提供 raw 版本：把 SECURITY_ATTRIBUTES 指针交给 CreateNamedPipeW
++    let mut server =
++        unsafe { opts.create_with_security_attributes_raw(PIPE_NAME, security.attributes_ptr())? };
++
++    eprintln!(
++        "[server] 监听 {}（DACL 已收紧：仅当前用户 + SYSTEM）",
++        PIPE_NAME
++    );
+ 
+     loop {
+-        let conn = listener.accept().await?;
++        server.connect().await?;
++
++        let connected = server;
+         let db2 = Arc::clone(&db);
+         let names2 = Arc::clone(&names);
+ 
++        // 先补上下一个实例，避免连接间隙里 client 撞到 ERROR_PIPE_BUSY
++        let mut opts = ServerOptions::new();
++        server = unsafe {
++            opts.create_with_security_attributes_raw(PIPE_NAME, security.attributes_ptr())?
++        };
++
+         tokio::spawn(async move {
+-            if let Err(e) = handle_connection_windows(conn, db2, names2).await {
++            if let Err(e) = handle_connection_windows(connected, db2, names2).await {
+                 eprintln!("[server] 连接处理错误: {}", e);
+             }
+         });
+@@ -107,7 +125,7 @@
+ 
+ #[cfg(windows)]
+ async fn handle_connection_windows(
+-    conn: interprocess::local_socket::tokio::Stream,
++    conn: tokio::net::windows::named_pipe::NamedPipeServer,
+     db: Arc<DbCache>,
+     names: Arc<tokio::sync::RwLock<Arc<Names>>>,
+ ) -> Result<()> {
+diff --git a/src/daemon/win_dacl.rs b/src/daemon/win_dacl.rs
+--- a/src/daemon/win_dacl.rs
++++ b/src/daemon/win_dacl.rs
+@@ -0,0 +1,115 @@
++//! Windows 具名管道的访问控制。
++//!
++//! `CreateNamedPipeW` 在 `SECURITY_ATTRIBUTES` 为 NULL 时，管道沿用创建进程
++//! 主 token 的默认 DACL；这个默认值并不可靠保证「只有当前用户能连」。
++//! 这里显式构造 `D:P(A;;GA;;;<当前用户 SID>)(A;;GA;;;SY)`，即只授予当前用户
++//! 与 SYSTEM 完全控制，并在创建每个管道实例时套用。
++//!
++//! Licensed under the Apache License, Version 2.0.
++
++use anyhow::{anyhow, Result};
++use windows::core::PCWSTR;
++use windows::Win32::Foundation::{CloseHandle, LocalFree, HANDLE, HLOCAL};
++use windows::Win32::Security::Authorization::{
++    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
++};
++use windows::Win32::Security::{
++    GetTokenInformation, TokenUser, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_QUERY,
++    TOKEN_USER,
++};
++use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
++
++/// 持有安全描述符与其 SECURITY_ATTRIBUTES 包装。
++///
++/// 安全描述符由 `ConvertStringSecurityDescriptorToSecurityDescriptorW` 分配，
++/// 必须在 Drop 时 `LocalFree`，否则每次创建管道实例都会泄漏一小块本地内存。
++pub struct PipeSecurity {
++    sd: PSECURITY_DESCRIPTOR,
++    sa: SECURITY_ATTRIBUTES,
++}
++
++impl PipeSecurity {
++    /// 传给 `create_with_security_attributes_raw` 的裸指针。
++    /// 生命周期由 `PipeSecurity` 自身保证，调用期间不可 drop。
++    pub fn attributes_ptr(&self) -> *mut core::ffi::c_void {
++        &self.sa as *const SECURITY_ATTRIBUTES as *mut core::ffi::c_void
++    }
++}
++
++impl Drop for PipeSecurity {
++    fn drop(&mut self) {
++        if !self.sd.is_invalid() {
++            unsafe {
++                let _ = LocalFree(HLOCAL(self.sd.0));
++            }
++        }
++    }
++}
++
++/// 构造「仅当前用户 + SYSTEM」的管道安全属性。
++pub fn current_user_only() -> Result<PipeSecurity> {
++    let sid = current_user_sid_string()?;
++    let sddl = format!("D:P(A;;GA;;;{})(A;;GA;;;SY)", sid);
++    let wide: Vec<u16> = sddl.encode_utf16().chain(std::iter::once(0)).collect();
++
++    let mut sd = PSECURITY_DESCRIPTOR::default();
++    unsafe {
++        ConvertStringSecurityDescriptorToSecurityDescriptorW(
++            PCWSTR(wide.as_ptr()),
++            SDDL_REVISION_1,
++            &mut sd,
++            None,
++        )
++        .map_err(|e| anyhow!("构造管道安全描述符失败（SDDL: {}）: {}", sddl, e))?;
++    }
++
++    let sa = SECURITY_ATTRIBUTES {
++        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
++        lpSecurityDescriptor: sd.0,
++        bInheritHandle: windows::Win32::Foundation::FALSE,
++    };
++
++    Ok(PipeSecurity { sd, sa })
++}
++
++/// 取当前进程 token 的用户 SID，转成 `S-1-5-...` 字符串。
++fn current_user_sid_string() -> Result<String> {
++    unsafe {
++        let mut token = HANDLE::default();
++        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token)
++            .map_err(|e| anyhow!("OpenProcessToken 失败: {}", e))?;
++
++        let result = (|| -> Result<String> {
++            let mut len = 0u32;
++            // 第一次只问长度，预期返回 ERROR_INSUFFICIENT_BUFFER
++            let _ = GetTokenInformation(token, TokenUser, None, 0, &mut len);
++            if len == 0 {
++                return Err(anyhow!("GetTokenInformation 未返回 TokenUser 所需长度"));
++            }
++
++            let mut buf = vec![0u8; len as usize];
++            GetTokenInformation(
++                token,
++                TokenUser,
++                Some(buf.as_mut_ptr() as *mut core::ffi::c_void),
++                len,
++                &mut len,
++            )
++            .map_err(|e| anyhow!("GetTokenInformation(TokenUser) 失败: {}", e))?;
++
++            let user = &*(buf.as_ptr() as *const TOKEN_USER);
++            let mut sid_str = windows::core::PWSTR::null();
++            ConvertSidToStringSidW(user.User.Sid, &mut sid_str)
++                .map_err(|e| anyhow!("ConvertSidToStringSidW 失败: {}", e))?;
++
++            let owned = sid_str
++                .to_string()
++                .map_err(|e| anyhow!("SID 转字符串失败: {}", e));
++            let _ = LocalFree(HLOCAL(sid_str.0 as *mut core::ffi::c_void));
++            owned
++        })();
++
++        let _ = CloseHandle(token);
++        result
++    }
++}

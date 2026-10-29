@@ -397,8 +397,22 @@ pub async fn q_history(
     with_meta: bool,
     debug_source: bool,
 ) -> Result<Value> {
-    let username =
-        resolve_username(chat, names).with_context(|| format!("找不到联系人: {}", chat))?;
+    // 解析不出联系人（如 folded 占位会话 brandsessionholder、企业微信 *@qy_g）
+    // 不当作错误：返回空结果 + meta.status，退出码 0。
+    // 理由：批量脚本按 wx sessions 逐条跑 history 时，一条占位会话不该中断整轮。
+    let Some(username) = resolve_username(chat, names) else {
+        return Ok(json!({
+            "chat": chat,
+            "chat_type": "unknown",
+            "count": 0,
+            "messages": [],
+            "meta": {
+                "status": "unresolved_contact",
+                "hint": format!("找不到联系人: {}（返回空结果）", chat),
+                "unknown_shards": current_unknown_shards(db, names),
+            }
+        }));
+    };
     let display = names.display(&username);
     let chat_type = chat_type_of(&username, names);
     let is_group = chat_type == "group";
@@ -418,7 +432,23 @@ pub async fn q_history(
     // 按时间路由分片：避免为「最近 N 条」解密全部 message_*.db
     let (shards, scanned) = find_msg_shards(db, names, &username, eff_since, eff_until).await?;
     if shards.is_empty() {
-        anyhow::bail!("找不到 {} 的消息记录", display);
+        // 联系人存在但没有落在这次时间窗里的分片：同样返回空结果而不是退出码 1。
+        let hint = if eff_since.is_some() || eff_until.is_some() || after_ts.is_some() || before_ts.is_some() {
+            format!("{} 在指定时间窗内没有消息（返回空结果）", display)
+        } else {
+            format!("{} 没有可用的消息分片（返回空结果）", display)
+        };
+        return Ok(json!({
+            "chat": display,
+            "chat_type": chat_type,
+            "count": 0,
+            "messages": [],
+            "meta": {
+                "status": "no_messages_in_window",
+                "hint": hint,
+                "unknown_shards": current_unknown_shards(db, names),
+            }
+        }));
     }
 
     let mut all_msgs: Vec<Value> = Vec::new();

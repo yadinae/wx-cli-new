@@ -1,0 +1,172 @@
+diff --git a/src/cli/doctor.rs b/src/cli/doctor.rs
+--- a/src/cli/doctor.rs
++++ b/src/cli/doctor.rs
+@@ -3,6 +3,7 @@
+ use anyhow::Result;
+ use serde_json::json;
+ use std::path::Path;
++#[cfg(not(target_os = "windows"))]
+ use std::process::Command;
+ 
+ use crate::config;
+@@ -53,6 +54,13 @@
+         if all_ok {
+             println!("\n全部检查通过。");
+         } else {
++            #[cfg(target_os = "windows")]
++            println!(
++                "\n存在未通过项。补密钥：{}\n\
++                 （以管理员身份打开 PowerShell 执行；确保微信已登录并保持运行）",
++                config::RECOMMENDED_KEY_EXTRACT
++            );
++            #[cfg(not(target_os = "windows"))]
+             println!(
+                 "\n存在未通过项。补密钥：{}\n\
+                  （本机 GUI Terminal + 等待时打开相关聊天；SIP 无需关闭）",
+@@ -279,18 +287,35 @@
+         });
+     }
+ 
+-    // daemon sock
+-    let sock = config::sock_path();
+-    out.push(Check {
+-        name: "daemon socket".into(),
+-        ok: sock.exists(),
+-        detail: if sock.exists() {
+-            sock.display().to_string()
+-        } else {
+-            "未运行（首次查询会自动启动）".into()
+-        },
+-        fix: Some("wx sessions 或 wx daemon start".into()),
+-    });
++    // daemon 在线状态：Unix 看 socket 文件，Windows 走命名管道 ping
++    #[cfg(unix)]
++    {
++        let sock = config::sock_path();
++        out.push(Check {
++            name: "daemon socket".into(),
++            ok: sock.exists(),
++            detail: if sock.exists() {
++                sock.display().to_string()
++            } else {
++                "未运行（首次查询会自动启动）".into()
++            },
++            fix: Some("wx sessions（会自动启动）或 wx daemon status".into()),
++        });
++    }
++    #[cfg(windows)]
++    {
++        let alive = crate::cli::transport::is_alive();
++        out.push(Check {
++            name: "daemon 管道".into(),
++            ok: alive,
++            detail: if alive {
++                r"\\.\pipe\wx-cli-daemon 已连通".into()
++            } else {
++                "未运行（首次查询会自动启动）".into()
++            },
++            fix: Some("wx sessions（会自动启动）或 wx daemon status".into()),
++        });
++    }
+ 
+     out
+ }
+@@ -338,8 +363,15 @@
+     }
+ }
+ 
++/// macOS / Linux：用 pgrep 匹配客户端主进程名（Windows 上没有 pgrep）
++#[cfg(not(target_os = "windows"))]
+ fn find_wechat_pid() -> Option<u32> {
+-    let out = Command::new("pgrep").args(["-x", "WeChat"]).output().ok()?;
++    #[cfg(target_os = "macos")]
++    const EXE: &str = "WeChat";
++    #[cfg(target_os = "linux")]
++    const EXE: &str = "wechat";
++
++    let out = Command::new("pgrep").args(["-x", EXE]).output().ok()?;
+     if !out.status.success() {
+         return None;
+     }
+@@ -351,6 +383,43 @@
+         .ok()
+ }
+ 
++/// Windows：没有 pgrep，用 Toolhelp 进程快照匹配 Weixin.exe（4.x）/ WeChat.exe（3.x）
++#[cfg(target_os = "windows")]
++fn find_wechat_pid() -> Option<u32> {
++    use windows::Win32::Foundation::CloseHandle;
++    use windows::Win32::System::Diagnostics::ToolHelp::{
++        CreateToolhelp32Snapshot, Process32First, Process32Next, PROCESSENTRY32, TH32CS_SNAPPROCESS,
++    };
++
++    // SAFETY: 标准 Toolhelp 快照遍历，句柄用完即关
++    unsafe {
++        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0).ok()?;
++        let mut entry = PROCESSENTRY32 {
++            dwSize: std::mem::size_of::<PROCESSENTRY32>() as u32,
++            ..Default::default()
++        };
++
++        let mut found = None;
++        if Process32First(snap, &mut entry).is_ok() {
++            loop {
++                let name = std::ffi::CStr::from_ptr(entry.szExeFile.as_ptr() as *const i8)
++                    .to_string_lossy();
++                if name.eq_ignore_ascii_case("Weixin.exe") || name.eq_ignore_ascii_case("WeChat.exe")
++                {
++                    found = Some(entry.th32ProcessID);
++                    break;
++                }
++                if Process32Next(snap, &mut entry).is_err() {
++                    break;
++                }
++            }
++        }
++
++        let _ = CloseHandle(snap);
++        found
++    }
++}
++
+ fn read_key_for(keys_path: &Path, rel: &str) -> Option<String> {
+     let content = std::fs::read_to_string(keys_path).ok()?;
+     let v: serde_json::Value = serde_json::from_str(&content).ok()?;
+diff --git a/src/config.rs b/src/config.rs
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -4,13 +4,20 @@
+ 
+ /// 产品统一推荐：补齐/重提数据库密钥（含冷分片 hook）。
+ /// 所有用户可见错误/警告应指向此命令，避免 `init --force` 与 `key extract` 分叉。
++#[cfg(not(target_os = "windows"))]
+ pub const RECOMMENDED_KEY_EXTRACT: &str = "sudo wx key extract --hook-seconds 90";
++#[cfg(target_os = "windows")]
++pub const RECOMMENDED_KEY_EXTRACT: &str = "wx key extract";
+ 
+ /// 带冷分片操作说明的完整提示（一行或多行均可嵌入）。
++#[cfg(not(target_os = "windows"))]
+ pub const RECOMMENDED_KEY_EXTRACT_HINT: &str =
+     "sudo wx key extract --hook-seconds 90（等待期间在微信中打开相关聊天以捕获冷分片密钥）";
++#[cfg(target_os = "windows")]
++pub const RECOMMENDED_KEY_EXTRACT_HINT: &str =
++    "wx key extract（以管理员身份运行；确保微信已登录并保持运行）";
+ 
+-#[cfg(test)]
++#[cfg(all(test, not(target_os = "windows")))]
+ mod recommended_cmd_tests {
+     use super::*;
+ 
+diff --git a/src/cli/key_cmd.rs b/src/cli/key_cmd.rs
+--- a/src/cli/key_cmd.rs
++++ b/src/cli/key_cmd.rs
+@@ -194,6 +194,9 @@
+ }
+ 
+ pub fn cmd_key_extract(hook_seconds: Option<u64>) -> Result<()> {
++    #[cfg(target_os = "windows")]
++    println!("提取密钥（扫描 Weixin.exe 进程内存；需以管理员身份运行）…");
++    #[cfg(not(target_os = "windows"))]
+     println!(
+         "提取密钥（内存扫描 + 可选 LLDB hook；推荐：{}）…",
+         config::RECOMMENDED_KEY_EXTRACT

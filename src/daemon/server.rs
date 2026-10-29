@@ -82,23 +82,41 @@ async fn serve_windows(
     db: Arc<DbCache>,
     names: Arc<tokio::sync::RwLock<Arc<Names>>>,
 ) -> Result<()> {
-    use interprocess::local_socket::{tokio::prelude::*, GenericNamespaced, ListenerOptions};
+    use tokio::net::windows::named_pipe::ServerOptions;
 
-    // interprocess 的 GenericNamespaced 在 Windows 上会自动拼接 `\\.\pipe\` 前缀，
-    // 这里必须传相对名；client 端用 `\\.\pipe\wx-cli-daemon` 直接打开可以对上
-    let name = "wx-cli-daemon".to_ns_name::<GenericNamespaced>()?;
-    let opts = ListenerOptions::new().name(name);
-    let listener = opts.create_tokio()?;
+    // 与 client 端（interprocess GenericNamespaced）保持同一个管道路径
+    const PIPE_NAME: &str = r"\\.\pipe\wx-cli-daemon";
 
-    eprintln!("[server] 监听 \\\\.\\pipe\\wx-cli-daemon");
+    // 显式 DACL：只允许当前用户与 SYSTEM 连接，不再依赖进程 token 的默认 DACL
+    let security = super::win_dacl::current_user_only()
+        .map_err(|e| anyhow::anyhow!("构造具名管道 DACL 失败: {}", e))?;
+
+    let mut opts = ServerOptions::new();
+    opts.first_pipe_instance(true);
+    // tokio 1.5x 起只提供 raw 版本：把 SECURITY_ATTRIBUTES 指针交给 CreateNamedPipeW
+    let mut server =
+        unsafe { opts.create_with_security_attributes_raw(PIPE_NAME, security.attributes_ptr())? };
+
+    eprintln!(
+        "[server] 监听 {}（DACL 已收紧：仅当前用户 + SYSTEM）",
+        PIPE_NAME
+    );
 
     loop {
-        let conn = listener.accept().await?;
+        server.connect().await?;
+
+        let connected = server;
         let db2 = Arc::clone(&db);
         let names2 = Arc::clone(&names);
 
+        // 先补上下一个实例，避免连接间隙里 client 撞到 ERROR_PIPE_BUSY
+        let mut opts = ServerOptions::new();
+        server = unsafe {
+            opts.create_with_security_attributes_raw(PIPE_NAME, security.attributes_ptr())?
+        };
+
         tokio::spawn(async move {
-            if let Err(e) = handle_connection_windows(conn, db2, names2).await {
+            if let Err(e) = handle_connection_windows(connected, db2, names2).await {
                 eprintln!("[server] 连接处理错误: {}", e);
             }
         });
@@ -107,7 +125,7 @@ async fn serve_windows(
 
 #[cfg(windows)]
 async fn handle_connection_windows(
-    conn: interprocess::local_socket::tokio::Stream,
+    conn: tokio::net::windows::named_pipe::NamedPipeServer,
     db: Arc<DbCache>,
     names: Arc<tokio::sync::RwLock<Arc<Names>>>,
 ) -> Result<()> {

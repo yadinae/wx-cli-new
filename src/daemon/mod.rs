@@ -3,6 +3,8 @@ pub mod meta;
 pub mod query;
 pub mod server;
 pub mod shard_meta;
+#[cfg(windows)]
+pub mod win_dacl;
 
 use anyhow::Result;
 use std::collections::HashMap;
@@ -112,6 +114,9 @@ async fn async_run() -> Result<()> {
     // 用 tokio::sync::RwLock 允许 guard 跨 await（当前不跨，为未来 reload 留余地）。
     let names_arc = Arc::new(tokio::sync::RwLock::new(Arc::new(names)));
 
+    // 跟随微信客户端退出：客户端进程消失后 daemon 自动退出并清理 pid/sock
+    spawn_client_watch();
+
     // 启动 IPC server（阻塞）
     let serve_result = server::serve(Arc::clone(&db), Arc::clone(&names_arc)).await;
     cleanup_ipc_files();
@@ -202,6 +207,101 @@ fn cleanup_and_exit() {
 fn cleanup_ipc_files() {
     let _ = std::fs::remove_file(config::sock_path());
     let _ = std::fs::remove_file(config::pid_path());
+}
+
+/// daemon 跟随微信客户端退出
+///
+/// 每 10 秒探测一次客户端进程，连续两次未命中即清理 pid/sock 后退出，
+/// 避免微信已经关掉、daemon 还挂在后台占用数据库句柄。
+/// 设置 `WX_DAEMON_FOLLOW_CLIENT=0` 可关闭该行为。
+fn spawn_client_watch() {
+    if std::env::var("WX_DAEMON_FOLLOW_CLIENT").as_deref() == Ok("0") {
+        eprintln!("[daemon] 已关闭「跟随微信退出」(WX_DAEMON_FOLLOW_CLIENT=0)");
+        return;
+    }
+
+    tokio::spawn(async move {
+        // 启动宽限期：微信可能还没起来或用户正在登录，先给 30 秒
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+
+        let mut misses = 0u32;
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            if client_process_running() {
+                misses = 0;
+                continue;
+            }
+            misses += 1;
+            if misses >= 2 {
+                eprintln!("[daemon] 微信客户端已退出，daemon 跟随退出");
+                cleanup_ipc_files();
+                std::process::exit(0);
+            }
+        }
+    });
+}
+
+#[cfg(target_os = "windows")]
+fn client_process_running() -> bool {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+
+    // 微信 4.x 是 Weixin.exe，3.x 时代是 WeChat.exe，两个都认
+    const CLIENT_EXES: [&str; 2] = ["Weixin.exe", "WeChat.exe"];
+
+    unsafe {
+        let snap = match CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) {
+            Ok(h) => h,
+            // 探测失败按「仍在运行」处理，宁可 daemon 多留一会，也不要误杀
+            Err(_) => return true,
+        };
+
+        let mut entry = PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+
+        let mut found = false;
+        if Process32FirstW(snap, &mut entry).is_ok() {
+            loop {
+                let end = entry
+                    .szExeFile
+                    .iter()
+                    .position(|&c| c == 0)
+                    .unwrap_or(entry.szExeFile.len());
+                let name = String::from_utf16_lossy(&entry.szExeFile[..end]);
+                if CLIENT_EXES.iter().any(|exe| exe.eq_ignore_ascii_case(&name)) {
+                    found = true;
+                    break;
+                }
+                if Process32NextW(snap, &mut entry).is_err() {
+                    break;
+                }
+            }
+        }
+
+        let _ = CloseHandle(snap);
+        found
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn client_process_running() -> bool {
+    // 用 pgrep 判断微信主进程是否还在，不额外引入依赖
+    match std::process::Command::new("pgrep").args(["-x", "WeChat"]).output() {
+        Ok(out) => out.status.success(),
+        // 探测失败按「仍在运行」处理
+        Err(_) => true,
+    }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn client_process_running() -> bool {
+    // Linux 侧走文件解密，没有必须跟随的客户端进程
+    true
 }
 
 #[cfg(test)]

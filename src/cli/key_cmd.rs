@@ -194,6 +194,9 @@ pub fn cmd_key_set(db_name: &str, enc_key: &str) -> Result<()> {
 }
 
 pub fn cmd_key_extract(hook_seconds: Option<u64>) -> Result<()> {
+    #[cfg(target_os = "windows")]
+    println!("提取密钥（扫描 Weixin.exe 进程内存；需以管理员身份运行）…");
+    #[cfg(not(target_os = "windows"))]
     println!(
         "提取密钥（内存扫描 + 可选 LLDB hook；推荐：{}）…",
         config::RECOMMENDED_KEY_EXTRACT

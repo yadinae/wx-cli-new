@@ -19,18 +19,21 @@
 通过 [skills CLI](https://github.com/vercel-labs/skills) 一键安装到 Claude Code、Cursor、Codex 等 agent：
 
 ```bash
-npx skills add botiverse/wx-cli
+npx skills add yadinae/wx-cli-again
 ```
 
 或全局安装：
 
 ```bash
-npx skills add botiverse/wx-cli -g
+npx skills add yadinae/wx-cli-again -g
 ```
 
 安装后 agent 会自动读取 `SKILL.md`，了解如何安装和调用 wx-cli。
 
-源码与发布仓库：[botiverse/wx-cli](https://github.com/botiverse/wx-cli)。
+源码与发布仓库：[yadinae/wx-cli-again](https://github.com/yadinae/wx-cli-again)。
+
+> **已验证版本**：本仓库在 **微信 4.1.15.56（Windows，Weixin.exe）** 上实机验证通过。
+> 详见 [CHANGES.md](CHANGES.md) 的各条修复记录。
 
 ---
 
@@ -45,14 +48,14 @@ npx skills add botiverse/wx-cli -g
 
 ## 安装
 
-> **当前仓库 [botiverse/wx-cli](https://github.com/botiverse/wx-cli) 为 private。**  
+> **当前仓库 [yadinae/wx-cli-again](https://github.com/yadinae/wx-cli-again) 为 public。**  
 > 匿名 `curl` / 公开 npm 旧包（`@jackwener/wx-cli@0.3.0`）**拿不到**本仓库最新二进制。  
-> 有仓库读权限时，请用下面的 **源码构建**（推荐）。
+> 请用下面的 **源码构建**（推荐）。
 
 ### 从源码构建（推荐）
 
 ```bash
-git clone git@github.com:botiverse/wx-cli.git && cd wx-cli
+git clone git@github.com:yadinae/wx-cli-again.git && cd wx-cli
 cargo build --release
 # 安装到用户 PATH（覆盖旧版）
 mkdir -p ~/.local/bin
@@ -63,7 +66,7 @@ wx --version   # 应显示当前 Cargo.toml 版本，如 0.6.3
 Windows：
 
 ```powershell
-git clone git@github.com:botiverse/wx-cli.git
+git clone git@github.com:yadinae/wx-cli-again.git
 cd wx-cli
 cargo build --release
 # 将 target\release\wx.exe 放到 PATH 目录
@@ -82,7 +85,7 @@ cp target/release/wx ~/.local/bin/wx
 
 **GitHub Release 预编译包**（仓库 private 时仅协作者可见）
 
-从 [Releases](https://github.com/botiverse/wx-cli/releases) 下载：
+从 [Releases](https://github.com/yadinae/wx-cli-again/releases) 下载：
 
 | 平台 | 文件 |
 |------|------|
@@ -99,15 +102,15 @@ chmod +x wx-macos-arm64 && mv wx-macos-arm64 ~/.local/bin/wx
 **一键脚本**（raw 链接在 private 仓库下对匿名用户 404；有权限时可用 `gh` 下载 release asset）
 
 ```bash
-# 需已登录 gh 且对 botiverse/wx-cli 有读权限
-gh release download -R botiverse/wx-cli -p 'wx-macos-arm64' -O ~/.local/bin/wx
+# 需已登录 gh 且对 yadinae/wx-cli-again 有读权限
+gh release download -R yadinae/wx-cli-again -p 'wx-macos-arm64' -O ~/.local/bin/wx
 chmod +x ~/.local/bin/wx
 ```
 
 `install.sh` / `install.ps1` 仍维护在仓库内，仓库公开或 raw 可访问后可再启用：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/botiverse/wx-cli/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/yadinae/wx-cli-again/main/install.sh | bash
 ```
 
 **npm**
