@@ -30,7 +30,7 @@ npx skills add yadinae/wx-cli-again -g
 
 安装后 agent 会自动读取 `SKILL.md`，了解如何安装和调用 wx-cli。
 
-源码与发布仓库：[yadinae/wx-cli-again](https://github.com/yadinae/wx-cli-again)。
+源码与发布仓库：[yadinae/wx-cli-again](https://github.com/yadinae/wx-cli-new)。
 
 > **已验证版本**：本仓库在 **微信 4.1.15.56（Windows，Weixin.exe）** 上实机验证通过。
 > 详见 [CHANGES.md](CHANGES.md) 的各条修复记录。
